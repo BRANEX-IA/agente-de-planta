@@ -1,0 +1,418 @@
+# Cerebro Sync → Branex OS — TODOS los repos de la org (propios Y de cliente) alimentan el Cerebro.
+# En cada push, este repo publica sus docs de conocimiento/arquitectura/avances/análisis a
+# os_documents (source='repo-doc'), usando el service_role que ya tiene como secret. NO usa deploy
+# key ni PAT (cada repo publica lo suyo) → funciona aunque la org deshabilite deploy keys.
+#
+# SEGURIDAD (Ley 1581) — la protección NO es excluir repos de cliente, es filtrar el CONTENIDO:
+#   (1) Escáner de PII determinista fail-closed: si un doc tiene cédula, teléfono, email, API key,
+#       keywords sensibles (icfes/sisben/becario…) o densidad de identificadores → se DESCARTA
+#       el doc entero (nunca entra al Cerebro). Un becario real jamás se indexa.
+#   (2) Alcance por MODO (env CEREBRO_SCOPE, lo fija ensure-sensors.sh):
+#       · 'inclusive' (repos INTERNOS): TODO .md de conocimiento (skills, agentes, docs…) salvo
+#         rutas de datos/build/vendor/clientes → cualquier cambio, incluso a un archivo existente.
+#       · 'allowlist' (DEFAULT + repos de CLIENTE): solo docs curados (gate @secure — el escáner
+#         no ve PII narrativa de becarios; en cliente se limita por RUTA). PII scanner corre en ambos.
+#   → comfama y todo cliente se conectan: su arquitectura/avances/análisis SÍ; su PII NO.
+#
+# EXCEPCIÓN branex-total (2026-07-16): branex-total tiene su PROPIO sensor canónico (mantenido por
+# Alex) que indexa con source='branex-total'. Este sensor NO debe re-indexarlo bajo source='repo-doc'
+# porque duplica 2.400+ chunks. El early-exit de abajo lo excluye por nombre de repo, robustamente.
+#
+# FTS-only (sin embedding acá); un job local vectoriza los chunks 'repo-doc'.
+# Idempotente por (org, source, source_ref, chunk_index); source_ref lleva el repo.id
+# INMUTABLE → un repo jamás pisa los chunks de otro.
+# content_hash = sha256(content normalizado) → permite dedup futuro y re-runs idempotentes.
+
+name: Cerebro Sync → Branex OS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.md"
+  workflow_dispatch: {}
+
+concurrency:
+  group: cerebro-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SUPA_URL: "https://jyaytcnribfbqtzdhowg.supabase.co"
+      ORG: "c0c18b72-65da-5f9e-afd0-bd02a68af07c"
+      SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      REPO: ${{ github.event.repository.name }}
+      REPO_ID: ${{ github.event.repository.id }}
+      REPO_FULL: ${{ github.repository }}
+      # Alcance del Cerebro: 'inclusive' solo en repos INTERNOS (lo fija ensure-sensors.sh);
+      # ausente/otro → 'allowlist' SEGURO por defecto (repos de cliente y cualquier repo nuevo).
+      CEREBRO_SCOPE: ${{ vars.CEREBRO_SCOPE || 'allowlist' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Publicar docs seguros al Cerebro
+        run: |
+          if [ -z "$SERVICE_ROLE" ]; then
+            echo "::error::SUPABASE_SERVICE_ROLE_KEY VACÍO → el Cerebro NO se actualizó."; exit 1
+          fi
+          python3 - <<'PY'
+          import os, re, json, fnmatch, hashlib, urllib.request, urllib.parse
+          import subprocess, datetime
+
+          SUPA = os.environ["SUPA_URL"].rstrip("/")
+          ORG  = os.environ["ORG"]
+          KEY  = os.environ["SERVICE_ROLE"]
+          REPO = os.environ.get("REPO", "repo")
+          REPO_ID = str(os.environ.get("REPO_ID", "0"))
+
+          # ── EARLY-EXIT: repos con sensor canónico propio no deben re-indexarse aquí.
+          # HISTÓRICO: branex-total tenía un sensor canónico de Alex (source='branex-total'). Ese sensor
+          # se RETIRÓ el 2026-07-06 → con el skip, branex-total quedó 14 DÍAS sin indexar (62 commits
+          # perdidos) mientras el CI salía verde (skip = "éxito"). Fix 2026-07-20 (Brayan): set VACÍO →
+          # cerebro-sync indexa branex-total inclusive (source='repo-doc', dedup content_hash). Esta es
+          # la FUENTE CANÓNICA que ensure-sensors.sh propaga a todos los repos; editar el generado no basta.
+          REPOS_CON_SENSOR_CANONICO = set()
+          if REPO.strip().lower() in REPOS_CON_SENSOR_CANONICO:
+              print(f"Cerebro ← {REPO}: SKIPPED — tiene sensor canónico propio (source != repo-doc). Sin duplicados.")
+              import sys; sys.exit(0)
+
+          # ── Alcance por MODO (CEREBRO_SCOPE), seguro por defecto (2026-07-09, gate @secure) ──
+          # 'inclusive' (SOLO repos INTERNOS de Branex): indexa TODO .md de conocimiento (skills,
+          #   agentes, docs…) salvo rutas excluidas → cualquier cambio, incluso a un archivo YA
+          #   existente, entra al Cerebro en tiempo real (el upsert refresca el contenido).
+          # 'allowlist' (DEFAULT + OBLIGATORIO en repos de CLIENTE): solo docs curados. Razón:
+          #   el escáner de PII no ve PII NARRATIVA (nombres de becarios en prosa, fecha de
+          #   nacimiento de un menor) → en cliente la superficie se limita por RUTA, no se confía
+          #   todo al escáner. La protección de contenido (escáner PII) corre en AMBOS modos.
+          SCOPE = os.environ.get("CEREBRO_SCOPE","allowlist").strip().lower()
+
+          # Rutas nunca indexadas: datos/build/vendor + carpetas de CLIENTE (ambos modos).
+          # "context/" excluye copias VENDORED de otros repos (context/<repo>/) → un repo que
+          # vendoriza otro (ej. Branex-os con context/branex-total/) NO lo re-indexa (anti-dup).
+          EXCL = ("node_modules/",".venv/","venv/","public/","/public/","data/","src/data",
+                  "_archive/",".git/","pdfs","becario","seed","dump",".env",
+                  "dist/","build/",".next/",".cache/","coverage/","vendor/",
+                  "__tests__/","/fixtures/",".turbo/",".vercel/","clientes/","clients/",
+                  "context/")
+          def excluded(rel):
+              low=rel.lower(); return any(x in low for x in EXCL)
+
+          # Allowlist curado — modo seguro / cliente / repos nuevos.
+          ALLOW_NAMES = {"claude.md","readme.md","agents.md","actualizaciones.md",
+                         "memory.md","calidad.md","contributing.md","design.md"}
+          ALLOW_DIRS  = ("docs/","handbook/")
+          def allowed(rel):
+              low=rel.lower(); base=low.rsplit("/",1)[-1]
+              if base in ALLOW_NAMES: return True
+              if low.startswith(ALLOW_DIRS): return True
+              if "arquitectura" in base or "architecture" in base: return True
+              if low.startswith("readme") and base.endswith(".md"): return True
+              return False
+
+          def in_scope(rel):
+              if excluded(rel): return False
+              return True if SCOPE == "inclusive" else allowed(rel)
+
+          # ── Capa 3: escáner de PII de PERSONA (para repos de CLIENTE). Detecta un DATO REAL con
+          #    NÚMERO, NO palabras-tema. Ya NO se bloquea por "becario"/"icfes"/"sisben" (son el TEMA
+          #    del proyecto de becas, no PII) — eso descartaba los AVANCES del cliente. Se descarta un
+          #    doc solo si trae PII formateada real de una persona (Ley 1581, zona protegida). ──
+          PII_PERSON_RE = [
+              re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),   # email
+              re.compile(r"\b3\d{2}[\s.\-]?\d{3}[\s.\-]?\d{4}\b"),              # móvil CO (con separadores)
+              re.compile(r"\b(?:c[eé]dula|c\.?c\.?|nit|documento)\D{0,15}\d{6,12}\b", re.I),  # cédula/NIT con número
+          ]
+          # Densidad: una tabla/dump con muchos números tipo-identificador = PII masiva (cédulas peladas).
+          CEDULA_LOOSE = re.compile(r"\b\d{7,11}\b")
+          def has_pii_person(text):
+              if any(p.search(text) for p in PII_PERSON_RE): return True
+              if len(CEDULA_LOOSE.findall(text)) >= 5: return True
+              return False
+
+          # ── Secretos VIVOS (credenciales) — nunca se indexan; se REDACTAN en línea (el doc entra
+          #    COMPLETO, solo la credencial se enmascara). Indexar una credencial viva en el Cerebro
+          #    —que consulta el Brain— sería regarla, no "ver un cambio". Aplica a AMBOS modos. ──
+          # Cobertura del stack real de Branex (gate @secure + @ai-auditor 2026-07-14). Cada línea
+          # es una credencial VIVA: si aparece se enmascara (y en repos internos, además se descarta
+          # el doc — ver el loop). NUNCA debe llegar un secreto vivo al Cerebro que consulta el Brain.
+          SECRET_RE = [
+              re.compile(r"AIza[0-9A-Za-z_\-]{20,}"),                          # Google API key
+              re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"),                         # OpenAI/Anthropic/OpenRouter (sk-, sk-ant-, sk-proj-, sk-or-)
+              re.compile(r"\b(?:sk|rk|whsec)_(?:live|test)_[A-Za-z0-9]{12,}"), # Stripe secret/restricted/webhook
+              re.compile(r"\b(?:prv|pub)_(?:prod|test)_[A-Za-z0-9]{16,}"),     # Wompi (Colombia)
+              re.compile(r"\bgsk_[A-Za-z0-9]{20,}"),                           # Groq
+              re.compile(r"\bhf_[A-Za-z0-9]{16,}"),                            # HuggingFace
+              re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}"),       # GitHub tokens clásicos
+              re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}"),                   # GitHub PAT fine-grained
+              re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}"),                      # GitLab PAT
+              re.compile(r"\bsb_secret[_A-Za-z0-9-]{16,}"),                    # Supabase service_role (incl. sb_secret_20_…)
+              re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                             # AWS access key id
+              re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),                   # Slack token
+              re.compile(r"postgres(?:ql)?://[^\s:@/]+:[^\s:@/]+@"),           # Postgres URL con password
+              re.compile(r"eyJ[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{10,}"),      # JWT (incl. service_role antiguo)
+          ]
+          def redact_secrets(text):
+              n=0
+              for rx in SECRET_RE:
+                  text,k = rx.subn("[SECRETO_REDACTADO]", text); n+=k
+              return text, n
+
+          # ── content_hash — sha256 del contenido normalizado (whitespace colapsado).
+          # Permite dedup futuro por hash, makes re-runs idempotentes sin comparar texto completo.
+          # Se calcula sobre el chunk YA redactado (las redacciones son parte del contenido canónico).
+          def content_hash(text):
+              normalized = " ".join(text.split())
+              return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+          # ── Recolectar .md permitidos, no excluidos, <200KB ──
+          #  · INCLUSIVE (repos internos): se indexa TODO. No se descarta por palabra ni PII; solo
+          #    se redacta una credencial VIVA en línea. "Todo se guarda y se ve" (decisión Brayan).
+          #  · ALLOWLIST (repos de CLIENTE): estricto Ley 1581 — un doc con PII de persona se DESCARTA.
+          docs=[]
+          for root,_,files in os.walk("."):
+              for f in files:
+                  if not f.lower().endswith(".md"): continue
+                  rel=os.path.relpath(os.path.join(root,f),".").replace("\\","/")
+                  if rel.startswith("./"): rel=rel[2:]
+                  if not in_scope(rel): continue   # modo inclusive/allowlist + PII abajo
+                  p=os.path.join(root,f)
+                  try:
+                      if os.path.getsize(p)>200_000: continue
+                      txt=open(p,encoding="utf-8",errors="ignore").read()
+                  except Exception: continue
+                  if not txt.strip(): continue
+                  # Secretos VIVOS: redactados en línea en AMBOS modos (el doc entra COMPLETO).
+                  txt, nred = redact_secrets(txt)
+                  if SCOPE != "inclusive":
+                      # CLIENTE (allowlist): archivos ya curados (los AVANCES). Se indexan y se VEN,
+                      # PERO si traen PII REAL de persona (número) se descarta el doc (Ley 1581, becarios/menores).
+                      if has_pii_person(txt):
+                          print(f"  ⨯ PII_BLOCKED path={rel} (PII de persona, doc descartado)"); continue
+                  if nred:
+                      print(f"  🔒 {nred} secreto(s) vivo(s) redactado(s) en {rel} (doc SÍ indexado)")
+                  docs.append((rel,txt))
+
+          def chunks_of(text,cap=1500):
+              out,parts=[],re.split(r"(?m)^(?=##\s)",text)
+              for part in parts:
+                  part=part.strip()
+                  if not part: continue
+                  if len(part)<=cap: out.append(part); continue
+                  buf=""
+                  for para in part.split("\n\n"):
+                      if buf and len(buf)+len(para)+2>cap: out.append(buf.strip()); buf=""
+                      buf+=para+"\n\n"
+                  if buf.strip(): out.append(buf.strip())
+              return [c for c in out if len(c)>=20]
+
+          def req(method,path,body=None,extra=None):
+              url=f"{SUPA}/rest/v1/{path}"
+              data=json.dumps(body).encode() if body is not None else None
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header("apikey",KEY); r.add_header("Authorization",f"Bearer {KEY}")
+              r.add_header("Content-Type","application/json")
+              for k,v in (extra or {}).items(): r.add_header(k,v)
+              with urllib.request.urlopen(r,timeout=30) as resp: return resp.status
+
+          total=0
+          for rel,txt in docs:
+              ref=f"{REPO_ID}:{REPO}:{rel}"          # repo.id INMUTABLE → sin colisión entre repos
+              cks=chunks_of(txt)
+              if not cks: continue
+              rows=[{"organization_id":ORG,"source":"repo-doc","source_ref":ref,
+                     "chunk_index":i,"content":c,
+                     "content_hash":content_hash(c),
+                     "metadata":{"repo":REPO,"repo_id":REPO_ID,"path":rel,"fts_only":True}}
+                    for i,c in enumerate(cks)]
+              ok=True
+              # UPSERT primero (sin ventana de pérdida), en lotes de 100
+              for j in range(0,len(rows),100):
+                  try:
+                      st=req("POST","os_documents?on_conflict=organization_id,source,source_ref,chunk_index",
+                             rows[j:j+100],{"Prefer":"resolution=merge-duplicates,return=minimal"})
+                      if st not in (200,201,204): ok=False; print(f"  ✗ upsert {ref}: HTTP {st}"); break
+                  except Exception as e: ok=False; print(f"  ✗ upsert {ref}: {e}"); break
+              if not ok: continue
+              # limpiar chunks viejos si el doc encogió (solo tras upsert OK)
+              q=urllib.parse.quote(ref,safe="")
+              try:
+                  req("DELETE",f"os_documents?organization_id=eq.{ORG}&source=eq.repo-doc"
+                      f"&source_ref=eq.{q}&chunk_index=gte.{len(cks)}",extra={"Prefer":"return=minimal"})
+              except Exception as e: print(f"  ⚠ limpieza {ref}: {e}")
+              total+=len(rows)
+          print(f"Cerebro ← {REPO}: {len(docs)} docs seguros, {total} chunks publicados (FTS).")
+
+          # ── ESTADO DEL PROYECTO: salud se refresca en CADA push ──────────────────────────────────
+          # Lógica de 3 ramas (en orden de prioridad decreciente):
+          #   1. actualizaciones.md con frontmatter válido → AUTORITATIVO (comportamiento anterior, sin cambios).
+          #   2. Review de 'actualizaciones' o 'revision-manual' más reciente que STALE_DAYS → SKIP del fallback.
+          #      No sobrescribe verdad humana fresca. Guarda 3 de las 5 guardas.
+          #   3. Sin frontmatter y sin verdad humana reciente → FALLBACK 'auto-push':
+          #      Score de frescura/momentum derivado del git del checkout (commits 14d + días desde el último).
+          #      Piso=45 (un proyecto con historia real nunca colapsa a 0 por estar quieto).
+          #      Delete+insert idempotente del review 'auto-push'. Solo el fallback se auto-reemplaza.
+          #
+          # Guardas activas (críticas):
+          #   G1 Frontmatter manda  — si hay estado válido en actualizaciones.md, Rama 1 corre, fallback NO.
+          #   G2 Sin match, sin acción — si metadata.repo_url no matchea ningún os_project, se loguea y sale.
+          #   G3 Verdad humana reciente — review actualizaciones|revision-manual < STALE_DAYS → no sobrescribir.
+          #   G4 Solo auto-push se pisa — delete+insert del review 'auto-push'; 'actualizaciones'/'revision-manual' INTOCABLES.
+          #   G5 Idempotente y org-scoped — todas las queries llevan organization_id=eq.{ORG}.
+          # ─────────────────────────────────────────────────────────────────────────────────────────
+
+          # Cuántos días puede tener un review humano antes de que el fallback lo supere.
+          STALE_DAYS = 30
+
+          def get_json(path):
+              url=f"{SUPA}/rest/v1/{path}"
+              r=urllib.request.Request(url); r.add_header("apikey",KEY); r.add_header("Authorization",f"Bearer {KEY}"); r.add_header("Accept","application/json")
+              with urllib.request.urlopen(r,timeout=30) as resp: return json.load(resp)
+
+          def git_momentum_score():
+              """Score 45-90 basado en commits de los últimos 14 días y días desde el último commit.
+              Requiere fetch-depth: 0 en el checkout para ver el historial completo.
+              Tabla de mapeo (score base + bonus actividad hasta +5):
+                días desde último commit  base   ejemplo
+                0-1                        88    push de hoy
+                2-6                        80    activo esta semana
+                7-14                       72    activo esta quincena
+                15-29                      60    quieto pero vivo
+                30-44                      52    adormecido
+                >=45                       45    piso (proyecto con historia real, no muerto)
+              """
+              try:
+                  r14 = subprocess.run(
+                      ["git","log","--oneline","--since=14 days ago"],
+                      capture_output=True, text=True, timeout=15
+                  )
+                  c14 = len([l for l in r14.stdout.splitlines() if l.strip()])
+                  r_last = subprocess.run(
+                      ["git","log","-1","--format=%ct"],
+                      capture_output=True, text=True, timeout=10
+                  )
+                  if r_last.stdout.strip():
+                      last_ts = int(r_last.stdout.strip())
+                      days_ago = (datetime.datetime.now().timestamp() - last_ts) / 86400
+                  else:
+                      days_ago = 999
+                  if   days_ago <= 1:  base = 88
+                  elif days_ago <= 6:  base = 80
+                  elif days_ago <= 14: base = 72
+                  elif days_ago <= 29: base = 60
+                  elif days_ago <= 44: base = 52
+                  else:                base = 45          # piso: historia real, solo quieto
+                  bonus = min(5, c14)
+                  score = min(90, base + bonus)
+                  return score, c14, int(days_ago)
+              except Exception as e:
+                  print(f"  warning git_momentum: {e}")
+                  return 55, 0, 999   # fallback conservador si git falla
+
+          # ── Match del proyecto por repo_url (match EXACTO — un repo no puede pisar otro proyecto) ──
+          repo_url = f"https://github.com/{os.environ.get('REPO_FULL','')}"
+          qurl = urllib.parse.quote(repo_url, safe="")
+          try:
+              cur = get_json(
+                  f"os_projects?organization_id=eq.{ORG}"
+                  f"&metadata->>repo_url=eq.{qurl}"
+                  f"&select=id,metadata"
+              )
+          except Exception as e:
+              cur = []; print(f"  warning proyecto {REPO}: {e}")
+
+          # G2: sin match → no hacer nada
+          if not cur:
+              print(f"  · {REPO}: sin os_project con repo_url={repo_url} — skip salud")
+          else:
+              pid = cur[0]["id"]; meta = cur[0].get("metadata") or {}
+
+              # ── Leer actualizaciones.md (solo la cabecera frontmatter) ──
+              try:
+                  au = open("actualizaciones.md", encoding="utf-8", errors="ignore").read() \
+                       if os.path.exists("actualizaciones.md") else ""
+              except Exception:
+                  au = ""
+              fm = re.match(r"^﻿?\s*---\s*\n(.*?)\n---\s*\n", au, re.S)
+
+              # ══ RAMA 1 — Frontmatter presente y con estado válido (G1: autoritativo) ══
+              if fm:
+                  front = {}
+                  for ln in fm.group(1).splitlines():
+                      if ":" in ln and not ln.strip().startswith("#"):
+                          k, v = ln.split(":", 1)
+                          front[k.strip()] = v.strip().strip('"').strip("'")
+                  EMAP = {"terminado":"entregado","entregado":"entregado","hecho":"entregado","done":"entregado",
+                          "activo":"activo","en curso":"activo","pausado":"pausado","idea":"idea",
+                          "archivado":"archivado","cancelado":"archivado"}
+                  estado = EMAP.get((front.get("estado") or "").strip().lower())
+                  try: avance = max(0, min(100, int(front.get("avance_pct","x"))))
+                  except Exception: avance = None
+                  if estado:
+                      if avance is not None: meta["avance_pct"] = avance
+                      if front.get("fase_actual"): meta["fase"] = front["fase_actual"]
+                      if front.get("proximo_hito"): meta["next_milestone"] = front["proximo_hito"]
+                      try: req("PATCH", f"os_projects?id=eq.{pid}", {"status": estado, "metadata": meta}, {"Prefer":"return=minimal"})
+                      except Exception as e: print(f"  ✗ patch proyecto: {e}")
+                      salud = (front.get("salud") or "").strip()
+                      score = int(salud) if salud.isdigit() else (100 if estado == "entregado" else avance)
+                      if score is not None:
+                          score = max(0, min(100, score))
+                          summ = f"Avance {avance if avance is not None else '—'}% · {estado} · {front.get('fase_actual','')}".strip()
+                          if has_pii_person(summ): summ = f"Avance {avance if avance is not None else '—'}% · {estado}"
+                          try:
+                              # G4: solo 'actualizaciones' se pisa (nunca 'revision-manual' ni 'auto-push')
+                              req("DELETE", f"os_project_reviews?organization_id=eq.{ORG}&project_id=eq.{pid}&reviewer=eq.actualizaciones", extra={"Prefer":"return=minimal"})
+                              req("POST", "os_project_reviews", [{"organization_id":ORG,"project_id":pid,"reviewer":"actualizaciones",
+                                  "score":score,"summary":summ,"findings":[]}], {"Prefer":"return=minimal"})
+                          except Exception as e: print(f"  ✗ review actualizaciones: {e}")
+                      print(f"Proyecto ({REPO}): estado={estado} · avance={avance} · salud={score} — actualizado desde actualizaciones.md")
+                  else:
+                      print(f"  · {REPO}: frontmatter sin estado reconocido — skip")
+
+              # ══ RAMA 2+3 — Sin frontmatter: fallback de frescura/momentum ══
+              else:
+                  # G3: ¿hay verdad humana reciente? Si es así, no sobrescribir.
+                  human_review_fresh = False
+                  try:
+                      reviews = get_json(
+                          f"os_project_reviews?organization_id=eq.{ORG}"
+                          f"&project_id=eq.{pid}"
+                          f"&reviewer=in.(actualizaciones,revision-manual)"
+                          f"&select=reviewer,created_at"
+                          f"&order=created_at.desc&limit=1"
+                      )
+                      if reviews:
+                          last_rev = reviews[0].get("created_at", "")
+                          try:
+                              dt = datetime.datetime.fromisoformat(last_rev.replace("Z", "+00:00"))
+                              age_days = (datetime.datetime.now(datetime.timezone.utc) - dt).days
+                              if age_days <= STALE_DAYS:
+                                  human_review_fresh = True
+                                  print(f"  · {REPO}: review '{reviews[0]['reviewer']}' hace {age_days}d — fallback omitido (verdad humana reciente)")
+                          except Exception as e:
+                              print(f"  warning parse review date: {e}")
+                  except Exception as e:
+                      print(f"  warning leer reviews: {e}")
+
+                  # G3 respetada → Rama 3: fallback auto-push
+                  if not human_review_fresh:
+                      score, c14, days_ago = git_momentum_score()
+                      summ = f"Momentum git: {c14} commits/14d, último hace {days_ago}d (auto-push)"
+                      print(f"Proyecto ({REPO}): salud={score} (auto-push) — commits14d={c14} days_since_last={days_ago}")
+                      try:
+                          # G4: solo el review 'auto-push' se delete+insert; los humanos son intocables
+                          req("DELETE", f"os_project_reviews?organization_id=eq.{ORG}&project_id=eq.{pid}&reviewer=eq.auto-push", extra={"Prefer":"return=minimal"})
+                          req("POST", "os_project_reviews", [{"organization_id":ORG,"project_id":pid,"reviewer":"auto-push",
+                              "score":score,"summary":summ,"findings":[]}], {"Prefer":"return=minimal"})
+                      except Exception as e: print(f"  ✗ auto-push review: {e}")
+          PY
