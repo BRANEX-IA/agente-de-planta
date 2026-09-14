@@ -30,6 +30,7 @@ const NOMBRE_DE_MANO: Record<string, string> = {
   cierreDePlanta: "Consultó el cierre de la planta",
   novedadesDelTurno: "Leyó las novedades del turno",
   avisarAlJefeDePlanta: "Aviso al jefe de planta",
+  enviarCorreo: "Enviar un correo",
   programarTarea: "Programar una tarea",
   verTareasProgramadas: "Revisó las tareas programadas",
   cancelarTareaProgramada: "Cancelar una tarea programada"
@@ -40,12 +41,35 @@ const nombreDeMano = (nombre: string) => NOMBRE_DE_MANO[nombre] ?? nombre;
 // Lo que ve el profe antes de firmar: el texto del aviso, o qué tarea se programa y cuándo. Nunca código.
 function resumenDeFirma(entrada: unknown) {
   const e = (entrada ?? {}) as {
+    para?: unknown;
+    formato?: unknown;
+    asunto?: unknown;
+    texto?: unknown;
     mensaje?: unknown;
     description?: unknown;
-    when?: { type?: string; cron?: string };
+    when?: {
+      type?: string;
+      cron?: string;
+      date?: unknown;
+      delayInSeconds?: unknown;
+    };
     taskId?: unknown;
   };
+  // Un correo: a quién va, con qué formato y el texto completo, antes de que salga.
+  if (typeof e.para === "string") {
+    const texto = typeof e.texto === "string" ? e.texto.trim() : "";
+    return e.formato === "informe"
+      ? `Para: ${e.para}\nFormato: informe de cierre de la planta${texto ? `\nNota: ${texto}` : ""}`
+      : `Para: ${e.para}\nAsunto: ${typeof e.asunto === "string" && e.asunto ? e.asunto : "Mensaje del agente de planta"}\n\n${texto}`;
+  }
   if (typeof e.mensaje === "string") return e.mensaje;
+  // La firma muestra el horario real, para que nadie firme a ciegas.
+  if (typeof e.description === "string" && e.when?.type === "scheduled")
+    return `${e.description} · una vez, el ${new Date(String(e.when.date)).toLocaleString("es-CO", { timeZone: "America/Bogota" })} (hora de Colombia)`;
+  if (typeof e.description === "string" && e.when?.type === "delayed") {
+    const segundos = Number(e.when.delayInSeconds);
+    return `${e.description} · una vez, dentro de ${segundos < 120 ? `${segundos} segundos` : `${Math.round(segundos / 60)} minutos`}`;
+  }
   if (typeof e.description === "string") {
     const cron = e.when?.type === "cron" ? (e.when.cron ?? "") : "";
     const partes = cron.trim().split(/\s+/);
