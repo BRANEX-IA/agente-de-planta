@@ -1,0 +1,123 @@
+name: Activity Sensor → Branex OS
+
+# Sensor de actividad: en cada push, registra los commits en os_activity (Supabase)
+# → aparecen EN VIVO en la cabina (/actividad). Requiere un secreto en el repo:
+#   SUPABASE_SERVICE_ROLE_KEY  (Settings → Secrets and variables → Actions)
+#
+# Convención de commits:
+#   "decision: <título>" → además de actividad, crea una fila en os_decisions con
+#   el mensaje completo como rationale. Así cerrar una mejora del sistema queda
+#   registrado como decisión sin fricción, solo escribiendo el commit bien.
+#
+# Commits [auto-commit] NO se registran como actividad individual (son ruido);
+# el Cerebro Sync los gestiona por su lado.
+
+on:
+  push:
+    branches: [main]
+
+# Least-privilege (@secure 2026-07-23): solo necesita salida HTTP a Supabase, no toca el repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: activity-sensor-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Registrar commits en os_activity y decisiones
+        env:
+          SUPA_URL: "https://jyaytcnribfbqtzdhowg.supabase.co"
+          SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ORG: "c0c18b72-65da-5f9e-afd0-bd02a68af07c"
+          REPO: ${{ github.event.repository.name }}
+          COMMITS: ${{ toJSON(github.event.commits) }}
+        run: |
+          if [ -z "$SERVICE_ROLE" ]; then
+            echo "::error::SUPABASE_SERVICE_ROLE_KEY VACÍO → el sensor NO capturó nada. Ponlo en Settings → Secrets and variables → Actions."; exit 1
+          fi
+          echo "$COMMITS" > commits.json
+
+          # ── 1. Actividad: filtra [auto-commit], enriquece títulos ──────────────
+          # [auto-commit] es ruido del Cerebro Sync (ya tiene su propio flujo).
+          # Commits con "decision:" se marcan con un título especial para que
+          # activity-log.ts los resalte en el feed.
+          jq --arg org "$ORG" --arg repo "$REPO" '
+            [.[] |
+              # Extraer primera línea del mensaje
+              (.message | split("\n")[0]) as $first_line |
+              # Saltar auto-commits (ruido del cerebro-sync)
+              if ($first_line | test("^\\[auto-commit\\]"; "i")) then empty
+              else
+                # Enriquecer título según convención
+                (if ($first_line | test("^decision\\s*:"; "i"))
+                 then ("Decisión: " + ($first_line | gsub("^[Dd]ecision\\s*:\\s*"; "") | .[0:160]))
+                 else ($first_line | .[0:180])
+                 end) as $title |
+                {
+                  organization_id: $org,
+                  actor: (.author.name // .author.username // "desconocido"),
+                  kind: "commit",
+                  title: $title,
+                  repo: $repo,
+                  ref: (.id[0:7]),
+                  url: .url
+                }
+              end
+            ]
+          ' commits.json > rows.json
+
+          COUNT=$(jq 'length' rows.json)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Sin commits significativos que registrar (todos eran auto-commits u omitidos)."; exit 0
+          fi
+          curl -sS -X POST "$SUPA_URL/rest/v1/os_activity" \
+            -H "apikey: $SERVICE_ROLE" \
+            -H "Authorization: Bearer $SERVICE_ROLE" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            --data @rows.json
+          echo "Registrados $COUNT commit(s) de actividad en Branex OS."
+
+          # ── 2. Decisiones: commits con "decision: <título>" → os_decisions ─────
+          # El mensaje COMPLETO del commit (todas las líneas) se guarda como
+          # rationale. El autor del commit es el "made_by". Idempotente: si el mismo
+          # sha ya existe (ref == commit id[:7]) no se duplica (on_conflict upsert).
+          # El espejo al Cerebro lo hace el endpoint /api/decisions; aquí solo la BD.
+          TODAY=$(date -u +%Y-%m-%d)
+          jq --arg org "$ORG" --arg repo "$REPO" --arg today "$TODAY" '
+            [.[] |
+              (.message | split("\n")[0]) as $first_line |
+              if ($first_line | test("^decision\\s*:"; "i")) then
+                # Título = todo después de "decision:"
+                (($first_line | gsub("^[Dd]ecision\\s*:\\s*"; "")) | .[0:200]) as $title |
+                # Rationale = mensaje completo (útil para el porqué)
+                (.message | .[0:4000]) as $rationale |
+                {
+                  organization_id: $org,
+                  title: $title,
+                  rationale: $rationale,
+                  context: ("Commit \(.id[0:7]) en \($repo)"),
+                  made_by: (.author.name // .author.username // "Equipo"),
+                  decided_at: $today,
+                  status: "abierta",
+                  tags: ["commit", $repo]
+                }
+              else empty
+              end
+            ]
+          ' commits.json > decisions.json
+
+          DEC_COUNT=$(jq 'length' decisions.json)
+          if [ "$DEC_COUNT" -gt 0 ]; then
+            curl -sS -X POST "$SUPA_URL/rest/v1/os_decisions" \
+              -H "apikey: $SERVICE_ROLE" \
+              -H "Authorization: Bearer $SERVICE_ROLE" \
+              -H "Content-Type: application/json" \
+              -H "Prefer: return=minimal" \
+              --data @decisions.json
+            echo "Registradas $DEC_COUNT decisión(es) desde commits en os_decisions."
+          fi
