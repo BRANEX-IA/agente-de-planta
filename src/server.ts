@@ -227,6 +227,10 @@ ${getSchedulePrompt({ date: new Date() })}
 Si el profe pide algo con horario, use programarTarea. Los horarios cron van en hora UTC y Colombia es UTC-5: las 6:30 a. m. de Colombia son «30 11 * * *». Una tarea programada solo lee y le muestra el resultado al profe (en la pantalla y, si lo conectó, en su Telegram); nunca le avisa nada a otra persona.${extra}`;
 }
 
+// Cómo se presenta el agente en Telegram. Se cambia aquí, sin tocar la parte protegida de Telegram.
+const NOMBRE_DEL_AGENTE = "su agente de planta";
+const PREGUNTA_DE_EJEMPLO = "¿Cómo cerró la planta ayer?";
+
 const EN_TELEGRAM = `
 
 Ahora el profe le escribe por Telegram. Responda en texto simple: sin tablas, sin asteriscos y sin símbolos de formato. Si una herramienta responde PENDIENTE DE SU FIRMA, diga en una línea que le dejó los botones Aprobar y Rechazar; todavía no se ha hecho nada.`;
@@ -928,7 +932,7 @@ export class ChatAgent extends AIChatAgent<Env> {
     await enviarTexto(
       token,
       chat,
-      "Listo: su celular quedó vinculado. Ya me puede dar órdenes por aquí (datos SIMULADOS).\n\nPregúnteme, por ejemplo: ¿Cómo cerró la planta ayer?\nPara desvincular este celular, escriba /salir."
+      `Listo: su celular quedó vinculado. Ya me puede dar órdenes por aquí (datos SIMULADOS).\n\nPregúnteme, por ejemplo: ${PREGUNTA_DE_EJEMPLO}\nPara desvincular este celular, escriba /salir.`
     );
     // Los que ya estaban se enteran, por si no fue el dueño.
     const otros = [...duenos].filter((c) => c !== llave);
@@ -988,7 +992,7 @@ export class ChatAgent extends AIChatAgent<Env> {
       await enviarTexto(
         token,
         chat,
-        "Hola, profe. Soy su agente de planta (datos SIMULADOS).\n\nPregúnteme, por ejemplo: ¿Cómo cerró la planta ayer?\nPara empezar una conversación nueva, escriba /nueva."
+        `Hola, profe. Soy ${NOMBRE_DEL_AGENTE} (datos SIMULADOS).\n\nPregúnteme, por ejemplo: ${PREGUNTA_DE_EJEMPLO}\nPara empezar una conversación nueva, escriba /nueva.`
       );
       return;
     }

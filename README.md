@@ -35,6 +35,22 @@ caídos, y no cumplen los módulos 3, 4, 6 y 7.
 Los cambios se hacen con Claude Code en la web: rama nueva → **Create PR** → **Merge** en GitHub. Workers Builds publica
 solo al actualizar `main`.
 
+## Construirlo con Claude Code: `/construir-agente`
+
+El repositorio trae una skill de proyecto en `.claude/skills/construir-agente/` y las reglas duras en `CLAUDE.md`. En
+Claude Code (web o terminal) basta con escribir `/construir-agente`: pregunta una cosa a la vez, propone un plan en palabras
+y sigue la guía que toque:
+
+| Guía                     | Para                                                                             |
+| ------------------------ | -------------------------------------------------------------------------------- |
+| `1-mi-agente.md`         | Convertir el agente de planta en el agente propio (la ficha del taller)          |
+| `2-mano-que-lee.md`      | Una herramienta que consulta, con datos SIMULADOS primero                        |
+| `3-mano-que-actua.md`    | Una herramienta que actúa, con firma y tope diario                               |
+| `4-tarea-con-horario.md` | Un resumen programado que solo lee                                               |
+| `5-sus-datos.md`         | Conectar datos propios según el semáforo: Google Sheets, D1 o AI Search          |
+| `6-formato-de-correo.md` | Un formato nuevo en `src/correo.ts`                                              |
+| `recibo.md`              | El chequeo final: clave, `SOLO_LEEN`, manos que actúan, Telegram, nombre y build |
+
 ## Telegram (opcional)
 
 1. En Telegram, `/newbot` a **@BotFather**. El token que entrega va como Secret `TELEGRAM_BOT_TOKEN` en Cloudflare, nunca en
