@@ -1,18 +1,27 @@
 ---
 name: construir-agente
-description: Paso a paso para convertir esta plantilla en el agente propio del dueño y enseñarle cosas nuevas (manos que leen, manos que actúan, tareas con horario, sus datos, formatos de correo) sin romper la clave ni la firma. Úsela cuando el dueño quiera crear su agente, agregarle algo, conectar datos o cambiar cómo se comporta.
+description: Paso a paso para crear su propio agente de IA en Cloudflare Workers, desde las cuentas hasta Telegram, correo y sus datos, y cambiarlo con Claude Code sin romper la clave ni la firma.
 argument-hint: "[qué quiere que haga su agente]"
 ---
 
 # Construir su agente
 
-Usted ayuda a una persona que **no programa** a construir su agente de IA sobre esta plantilla (Cloudflare Workers con el
-Agents SDK). Háblele **de usted**, en español de Colombia, con palabras simples y **una pregunta a la vez**. No le muestre
-código salvo que lo pida: cuéntele en palabras qué va a cambiar.
+Usted ayuda a una persona que **no programa** a construir su agente de IA sobre la plantilla de Branex (Cloudflare Workers
+con el Agents SDK). Háblele **de usted**, en español de Colombia, con palabras simples y **una pregunta a la vez**. No le
+muestre código salvo que lo pida: cuéntele en palabras qué va a cambiar. **Nunca le pida claves, tokens ni contraseñas en
+el chat.**
 
-## 1. Antes de tocar nada
+## 0. ¿Dónde está?
 
-1. Lea `CLAUDE.md` de la raíz: son las reglas que no se rompen.
+- **Sin el repositorio del agente abierto** (por ejemplo en claude.ai, o si el dueño todavía no ha publicado su agente):
+  use el **modo guía** de [0-desde-cero.md](0-desde-cero.md). Lo lleva paso a paso desde las cuentas hasta Telegram y el
+  correo.
+- **Dentro del repositorio del agente** (existen `src/server.ts` y `wrangler.jsonc`): use el **modo construir**, que
+  sigue abajo.
+
+## 1. Antes de tocar nada (modo construir)
+
+1. Lea [reglas.md](reglas.md): son las reglas que no se rompen, las mismas del `CLAUDE.md` del agente.
 2. Si no están instaladas las dependencias, corra `npm install`.
 3. Si el dueño no dijo qué quiere, pregúntele con estas opciones y siga la guía que corresponda:
 
@@ -26,8 +35,8 @@ código salvo que lo pida: cuéntele en palabras qué va a cambiar.
 | Mande un tipo de correo nuevo                                   | [6-formato-de-correo.md](6-formato-de-correo.md)                      |
 | Se comporte distinto                                            | Cambie solo `INSTRUCCIONES` en `src/server.ts` y cierre con el paso 3 |
 
-4. Pregunte siempre **de qué color son los datos** que va a tocar (semáforo, regla 9 de `CLAUDE.md`). Si son rojos,
-   deténgase y explíquele por qué.
+4. Pregunte siempre **de qué color son los datos** que va a tocar (semáforo, regla 9). Si son rojos, deténgase y
+   explíquele por qué.
 
 ## 2. Mientras construye
 
