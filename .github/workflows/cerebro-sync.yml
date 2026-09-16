@@ -269,13 +269,22 @@ jobs:
           else:
               try:
                   # `req` solo devuelve el status, así que el GET se arma aparte (mismas cabeceras).
+                  # DOS detalles que ya costaron un HTTP 500 en la primera versión:
+                  #  · `chunk_index=eq.0` → una fila por DOCUMENTO, no por fragmento (era ~5× más).
+                  #  · paginación explícita → PostgREST corta en 1000 filas y este repo ya pasa de 800.
                   pref=urllib.parse.quote(f"{REPO_ID}:{REPO}:", safe="")
-                  url=(f"{SUPA}/rest/v1/os_documents?select=source_ref"
-                       f"&organization_id=eq.{ORG}&source=eq.repo-doc&source_ref=like.{pref}*")
-                  rq=urllib.request.Request(url)
-                  rq.add_header("apikey",KEY); rq.add_header("Authorization",f"Bearer {KEY}")
-                  with urllib.request.urlopen(rq, timeout=30) as resp:
-                      existentes={x["source_ref"] for x in json.loads(resp.read().decode())}
+                  existentes=set(); off=0; PAG=500
+                  while True:
+                      url=(f"{SUPA}/rest/v1/os_documents?select=source_ref"
+                           f"&organization_id=eq.{ORG}&source=eq.repo-doc&chunk_index=eq.0"
+                           f"&source_ref=like.{pref}*&limit={PAG}&offset={off}")
+                      rq=urllib.request.Request(url)
+                      rq.add_header("apikey",KEY); rq.add_header("Authorization",f"Bearer {KEY}")
+                      with urllib.request.urlopen(rq, timeout=30) as resp:
+                          lote=json.loads(resp.read().decode())
+                      existentes |= {x["source_ref"] for x in lote}
+                      if len(lote) < PAG: break
+                      off += PAG
                   huerfanos=sorted(existentes - vistos)
                   for h in huerfanos:
                       q=urllib.parse.quote(h, safe="")
