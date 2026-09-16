@@ -27,7 +27,10 @@ name: Cerebro Sync → Branex OS
 
 on:
   push:
-    branches: [main]
+    # OJO: la cabina de producción se despliega desde `feat/routines-smtp-delivery`, no desde main.
+    # Escuchar solo `main` dejaba los docs de este repo SIN llegar al Cerebro: entre el 31-ago y el
+    # 16-sep-2026 este workflow no corrió ni una vez. Se escuchan ambas hasta unificar la rama.
+    branches: [main, feat/routines-smtp-delivery]
     paths:
       - "**/*.md"
   workflow_dispatch: {}
@@ -225,8 +228,10 @@ jobs:
               with urllib.request.urlopen(r,timeout=30) as resp: return resp.status
 
           total=0
+          vistos=set()                               # refs vigentes de ESTA corrida (para barrer huérfanos)
           for rel,txt in docs:
               ref=f"{REPO_ID}:{REPO}:{rel}"          # repo.id INMUTABLE → sin colisión entre repos
+              vistos.add(ref)
               cks=chunks_of(txt)
               if not cks: continue
               rows=[{"organization_id":ORG,"source":"repo-doc","source_ref":ref,
@@ -251,6 +256,36 @@ jobs:
               except Exception as e: print(f"  ⚠ limpieza {ref}: {e}")
               total+=len(rows)
           print(f"Cerebro ← {REPO}: {len(docs)} docs seguros, {total} chunks publicados (FTS).")
+
+          # ── BARRER HUÉRFANOS: lo que se borró del repo debe borrarse del Cerebro ──────────────
+          # Sin esto el Cerebro NUNCA olvida: un .md eliminado (o que dejó de estar en alcance, o
+          # que ahora se bloquea por PII) sigue ahí y el Brain lo puede citar como si existiera.
+          # Pasó de verdad: al borrar la skill vercel-webapp quedaron 26 chunks suyos vivos.
+          # El escaneo es del repo COMPLETO (os.walk sobre "."), así que lo que no esté en `vistos`
+          # de verdad ya no existe. Blindaje: si el escaneo salió vacío NO se borra nada — un fallo
+          # del scan no puede vaciar el Cerebro (mismo criterio que EMPTY_ARSENAL en arsenal-sync).
+          if not docs:
+              print("  ⚠ escaneo vacío: NO se barren huérfanos (blindaje anti-vaciado).")
+          else:
+              try:
+                  # `req` solo devuelve el status, así que el GET se arma aparte (mismas cabeceras).
+                  pref=urllib.parse.quote(f"{REPO_ID}:{REPO}:", safe="")
+                  url=(f"{SUPA}/rest/v1/os_documents?select=source_ref"
+                       f"&organization_id=eq.{ORG}&source=eq.repo-doc&source_ref=like.{pref}*")
+                  rq=urllib.request.Request(url)
+                  rq.add_header("apikey",KEY); rq.add_header("Authorization",f"Bearer {KEY}")
+                  with urllib.request.urlopen(rq, timeout=30) as resp:
+                      existentes={x["source_ref"] for x in json.loads(resp.read().decode())}
+                  huerfanos=sorted(existentes - vistos)
+                  for h in huerfanos:
+                      q=urllib.parse.quote(h, safe="")
+                      req("DELETE", f"os_documents?organization_id=eq.{ORG}&source=eq.repo-doc"
+                                    f"&source_ref=eq.{q}", extra={"Prefer":"return=minimal"})
+                  if huerfanos:
+                      print(f"  ✔ huérfanos barridos: {len(huerfanos)} doc(s) que ya no existen en el repo")
+                      for h in huerfanos[:10]: print(f"      · {h.split(':',2)[-1]}")
+              except Exception as e:
+                  print(f"  ⚠ no pude barrer huérfanos: {type(e).__name__}: {e}")
 
           # ── ESTADO DEL PROYECTO: salud se refresca en CADA push ──────────────────────────────────
           # Lógica de 3 ramas (en orden de prioridad decreciente):
