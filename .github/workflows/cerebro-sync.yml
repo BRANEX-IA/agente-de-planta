@@ -102,8 +102,15 @@ jobs:
           # Rutas nunca indexadas: datos/build/vendor + carpetas de CLIENTE (ambos modos).
           # "context/" excluye copias VENDORED de otros repos (context/<repo>/) → un repo que
           # vendoriza otro (ej. Branex-os con context/branex-total/) NO lo re-indexa (anti-dup).
+          # "_legacy/" y "_deprecated/": doctrina RETIRADA a propósito. Apartarla del repo no basta
+          # si el Cerebro la indexa igual — el 18-sep-2026 El Forjador recuperó de ahí
+          # routines/_legacy/sales/*.md, los citó como si fueran ruta VIVA (routines/sales/...),
+          # afirmó que "el agente de Outreach ya existe" (no existe: solo hay ese documento
+          # retirado) y armó un encargo de construcción encima. El README de _legacy advertía
+          # exactamente eso: son "la semilla desde la que alguien (persona o agente) la vuelve a
+          # sembrar". La cuarentena tiene que valer también en la puerta del Cerebro.
           EXCL = ("node_modules/",".venv/","venv/","public/","/public/","data/","src/data",
-                  "_archive/",".git/","pdfs","becario","seed","dump",".env",
+                  "_archive/","_legacy/","_deprecated/",".git/","pdfs","becario","seed","dump",".env",
                   "dist/","build/",".next/",".cache/","coverage/","vendor/",
                   "__tests__/","/fixtures/",".turbo/",".vercel/","clientes/","clients/",
                   "context/")
