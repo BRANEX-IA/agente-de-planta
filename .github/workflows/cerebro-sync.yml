@@ -370,12 +370,21 @@ jobs:
                   return 55, 0, 999   # fallback conservador si git falla
 
           # ── Match del proyecto por repo_url (match EXACTO — un repo no puede pisar otro proyecto) ──
+          # Se busca en LOS DOS lugares donde puede vivir la URL, porque hay dos escritores:
+          #   · `repo_url` COLUMNA  ← la escribe sensors/intake_proyectos.py desde el proyecto.yml
+          #   · `metadata.repo_url` ← se puso a mano en algunos proyectos viejos
+          # Buscar solo en metadata dejaba FUERA a todo proyecto registrado por el intake: el 19-sep
+          # eran 5 de 10 (ci-el-globo, comfama-fraternidad, importcalc, money-os,
+          # 5-emprendimientos-esumer). Su salud y su estado llevaban meses congelados mientras el
+          # workflow salía VERDE en cada push, imprimiendo «skip salud» que nadie lee. Caso real:
+          # El Globo acumuló 4 commits y dos dominios desplegados y el tablero seguía diciendo
+          # «idea, salud 35».
           repo_url = f"https://github.com/{os.environ.get('REPO_FULL','')}"
           qurl = urllib.parse.quote(repo_url, safe="")
           try:
               cur = get_json(
                   f"os_projects?organization_id=eq.{ORG}"
-                  f"&metadata->>repo_url=eq.{qurl}"
+                  f"&or=(repo_url.eq.{qurl},metadata->>repo_url.eq.{qurl})"
                   f"&select=id,metadata"
               )
           except Exception as e:
